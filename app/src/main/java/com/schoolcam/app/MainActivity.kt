@@ -676,5 +676,371 @@ class MainActivity : ComponentActivity() {
         reviewButton.text = if (review) "RECAPTURE" else "RECAPTURE"
     }
 
-    private fun returnToCamera() {
-        reviewImage.setImageDrawable(
+    
+private fun returnToCamera() {
+    reviewImage.setImageDrawable(null)
+
+    capturedBitmap?.recycle()
+    capturedBitmap = null
+    reviewBitmap = null
+
+    isReviewMode = false
+    cameraPanel.visibility = View.VISIBLE
+    reviewPanel.visibility = View.GONE
+
+    noteInput.setText("")
+    status.text = "Ready to capture"
+    updateReviewControls(false)
+}
+
+private fun startLocationUpdates() {
+    if (
+        ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) != PackageManager.PERMISSION_GRANTED &&
+        ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        ) != PackageManager.PERMISSION_GRANTED
+    ) {
+        locationText.text = "GPS permission not granted"
+        return
+    }
+
+    try {
+        val providers = locationManager.getProviders(true)
+
+        for (provider in providers) {
+            val last = locationManager.getLastKnownLocation(provider)
+            if (last != null) {
+                capturedLocation = last
+                updateLocationText(last)
+                lookupAddress(last)
+                break
+            }
+        }
+
+        locationManager.requestLocationUpdates(
+            LocationManager.GPS_PROVIDER,
+            2000L,
+            1f,
+            locationListener,
+            Looper.getMainLooper()
+        )
+    } catch (e: SecurityException) {
+        locationText.text = "GPS permission unavailable"
+    } catch (e: Exception) {
+        locationText.text = "Waiting for GPS location"
+    }
+}
+
+private fun updateLocationText(location: Location) {
+    locationText.text = String.format(
+        Locale.US,
+        "Lat: %.6f | Long: %.6f | Accuracy: %.0f m",
+        location.latitude,
+        location.longitude,
+        location.accuracy
+    )
+}
+
+private fun lookupAddress(location: Location) {
+    locationExecutor.execute {
+        try {
+            @Suppress("DEPRECATION")
+            val addresses = Geocoder(
+                this,
+                Locale.getDefault()
+            ).getFromLocation(
+                location.latitude,
+                location.longitude,
+                1
+            )
+
+            if (!addresses.isNullOrEmpty()) {
+                val address = addresses[0]
+                val text = (0..address.maxAddressLineIndex)
+                    .mapNotNull { address.getAddressLine(it) }
+                    .joinToString(", ")
+
+                if (text.isNotBlank()) {
+                    capturedAddress = text
+                }
+            }
+        } catch (_: Exception) {
+            capturedAddress = "Address unavailable"
+        }
+    }
+}
+
+private fun savePhoto() {
+    val source = capturedBitmap ?: run {
+        status.text = "No photo to save"
+        return
+    }
+
+    saveButton.isEnabled = false
+    status.text = "Saving photo..."
+
+    val note = noteInput.text.toString().trim()
+    val location = capturedLocation
+    val address = capturedAddress
+    val time = capturedAt
+
+    cameraExecutor.execute {
+        var watermarked: Bitmap? = null
+        var uri: Uri? = null
+
+        try {
+            watermarked = addWatermark(
+                source,
+                note,
+                location,
+                address,
+                time
+            )
+
+            val filename = SimpleDateFormat(
+                "yyyyMMdd_HHmmss",
+                Locale.US
+            ).format(Date(time))
+
+            val values = ContentValues().apply {
+                put(
+                    MediaStore.Images.Media.DISPLAY_NAME,
+                    "SchoolCam_$filename.jpg"
+                )
+                put(
+                    MediaStore.Images.Media.MIME_TYPE,
+                    "image/jpeg"
+                )
+                put(
+                    MediaStore.Images.Media.RELATIVE_PATH,
+                    "Pictures/SchoolCam"
+                )
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
+                }
+            }
+
+            uri = contentResolver.insert(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                values
+            ) ?: error("Unable to create image file")
+
+            val stream = contentResolver.openOutputStream(uri!!)
+                ?: error("Unable to open image file")
+
+            stream.use {
+                if (!watermarked.compress(
+                        Bitmap.CompressFormat.JPEG,
+                        95,
+                        it
+                    )
+                ) {
+                    error("Unable to encode image")
+                }
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val done = ContentValues().apply {
+                    put(MediaStore.Images.Media.IS_PENDING, 0)
+                }
+                contentResolver.update(uri!!, done, null, null)
+            }
+
+            runOnUiThread {
+                status.text = "Saved to Pictures/SchoolCam"
+                Toast.makeText(
+                    this,
+                    "Photo saved successfully",
+                    Toast.LENGTH_LONG
+                ).show()
+                saveButton.isEnabled = true
+                returnToCamera()
+            }
+        } catch (e: Exception) {
+            uri?.let {
+                try {
+                    contentResolver.delete(it, null, null)
+                } catch (_: Exception) {
+                }
+            }
+
+            runOnUiThread {
+                status.text = "Save failed: ${e.localizedMessage}"
+                saveButton.isEnabled = true
+            }
+        } finally {
+            watermarked?.recycle()
+        }
+    }
+}
+
+private fun addWatermark(
+    original: Bitmap,
+    note: String,
+    location: Location?,
+    address: String,
+    time: Long
+): Bitmap {
+    val output = original.copy(Bitmap.Config.ARGB_8888, true)
+        ?: error("Unable to prepare image")
+
+    val canvas = Canvas(output)
+    val scale = output.width / 1080f
+    val padding = (22f * scale).coerceAtLeast(12f)
+    val textSize = (29f * scale).coerceAtLeast(18f)
+    val lineHeight = textSize * 1.4f
+    val maxWidth = output.width - padding * 2
+
+    val lines = mutableListOf<String>()
+    lines.add("SchoolCam")
+
+    lines.add(
+        "Date/Time: " + SimpleDateFormat(
+            "dd-MM-yyyy hh:mm:ss a",
+            Locale.getDefault()
+        ).format(Date(time))
+    )
+
+    if (location != null) {
+        lines.add(
+            String.format(
+                Locale.US,
+                "Latitude: %.6f",
+                location.latitude
+            )
+        )
+        lines.add(
+            String.format(
+                Locale.US,
+                "Longitude: %.6f",
+                location.longitude
+            )
+        )
+        lines.add("Accuracy: %.0f m".format(location.accuracy))
+    } else {
+        lines.add("GPS location unavailable")
+    }
+
+    if (address.isNotBlank()) {
+        lines.add("Address: $address")
+    }
+
+    if (note.isNotBlank()) {
+        lines.add("Note: ${note.replace("\n", " ")}")
+    }
+
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        this.textSize = textSize
+        typeface = Typeface.create(
+            "sans-serif-medium",
+            Typeface.BOLD
+        )
+    }
+
+    val wrapped = mutableListOf<String>()
+
+    for (text in lines) {
+        var current = ""
+        for (word in text.split(" ")) {
+            val candidate =
+                if (current.isEmpty()) word else "$current $word"
+
+            if (paint.measureText(candidate) <= maxWidth) {
+                current = candidate
+            } else {
+                if (current.isNotEmpty()) wrapped.add(current)
+                current = word
+            }
+        }
+        if (current.isNotEmpty()) wrapped.add(current)
+    }
+
+    val panelHeight = padding * 2 + lineHeight * wrapped.size
+    val top = (output.height - panelHeight).coerceAtLeast(0f)
+
+    val panelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(210, 5, 12, 25)
+    }
+
+    canvas.drawRect(
+        0f,
+        top,
+        output.width.toFloat(),
+        output.height.toFloat(),
+        panelPaint
+    )
+
+    wrapped.forEachIndexed { index, text ->
+        val y = top + padding + textSize + index * lineHeight
+        if (y < output.height) {
+            canvas.drawText(text, padding, y, paint)
+        }
+    }
+
+    return output
+}
+
+private fun makeButton(
+    label: String,
+    action: () -> Unit
+): Button {
+    return Button(this).apply {
+        text = label
+        textSize = 11f
+        isAllCaps = false
+        setTextColor(Color.WHITE)
+        background = roundedBackground(
+            Color.rgb(34, 91, 155),
+            10
+        )
+        setOnClickListener { action() }
+    }
+}
+
+private fun roundedBackground(
+    color: Int,
+    radiusDp: Int
+): GradientDrawable {
+    return GradientDrawable().apply {
+        setColor(color)
+        cornerRadius = dp(radiusDp).toFloat()
+    }
+}
+
+private fun weightParams(): LinearLayout.LayoutParams {
+    return LinearLayout.LayoutParams(
+        0,
+        dp(48),
+        1f
+    ).apply {
+        setMargins(dp(2), dp(2), dp(2), dp(2))
+    }
+}
+
+private fun dp(value: Int): Int {
+    return (value * resources.displayMetrics.density).toInt()
+}
+
+override fun onDestroy() {
+    try {
+        locationManager.removeUpdates(locationListener)
+    } catch (_: Exception) {
+    }
+
+    cameraExecutor.shutdown()
+    locationExecutor.shutdown()
+
+    reviewImage.setImageDrawable(null)
+    capturedBitmap?.recycle()
+    capturedBitmap = null
+    reviewBitmap = null
+
+    super.onDestroy()
+}
+}
+
