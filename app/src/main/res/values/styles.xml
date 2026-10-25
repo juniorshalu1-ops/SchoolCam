@@ -1,9 +1,0 @@
-<resources>
-    <style name="Theme.SchoolCam" parent="Theme.Material3.DayNight.NoActionBar">
-        <item name="android:fontFamily">sans</item>
-        <item name="android:colorAccent">#5EA7FF</item>
-        <item name="android:navigationBarColor">#080D18</item>
-        <item name="android:statusBarColor">#080D18</item>
-        <item name="android:windowLightStatusBar">false</item>
-    </style>
-</resources>
