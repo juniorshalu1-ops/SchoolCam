@@ -1,3 +1,4 @@
+
 package com.schoolcam.app
 
 import android.Manifest
@@ -638,4 +639,149 @@ class MainActivity : ComponentActivity() {
                 SimpleDateFormat(
                     "yyyy:MM:dd HH:mm:ss",
                     Locale.US
-  
+                ).format(Date())
+            )
+
+            exif.saveAttributes()
+        } catch (_: Exception) {
+            // Visible watermark is still saved even if EXIF fails
+        }
+    }
+
+    private fun startLocationUpdates() {
+        try {
+            if (hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) ||
+                hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+            ) {
+                if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                    locationManager.requestLocationUpdates(
+                        LocationManager.GPS_PROVIDER,
+                        2000L,
+                        1f,
+                        locationListener
+                    )
+                }
+                if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+                    locationManager.requestLocationUpdates(
+                        LocationManager.NETWORK_PROVIDER,
+                        2000L,
+                        1f,
+                        locationListener
+                    )
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun savePhoto() {
+        val file = watermarkedFile ?: return
+
+        try {
+            val contentValues = ContentValues().apply {
+                put(
+                    MediaStore.MediaColumns.DISPLAY_NAME,
+                    "SchoolCam_${System.currentTimeMillis()}.jpg"
+                )
+                put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(
+                        MediaStore.MediaColumns.RELATIVE_PATH,
+                        Environment.DIRECTORY_PICTURES + "/SchoolCam"
+                    )
+                }
+            }
+
+            val resolver = contentResolver
+            val uri = resolver.insert(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                contentValues
+            )
+
+            uri?.let { destinationUri ->
+                resolver.openOutputStream(destinationUri)?.use { outputStream ->
+                    file.inputStream().use { inputStream ->
+                        inputStream.copyTo(outputStream)
+                    }
+                }
+                showToast("Photo saved to Gallery!")
+                statusText.text = "Photo saved successfully."
+            } ?: throw IOException("Failed to create MediaStore entry.")
+
+            resetToCamera()
+        } catch (exception: Exception) {
+            showToast("Failed to save photo.")
+            statusText.text = "Error saving: ${exception.localizedMessage}"
+        }
+    }
+
+    private fun recapturePhoto() {
+        resetToCamera()
+        statusText.text = "Camera ready."
+    }
+
+    private fun resetToCamera() {
+        isReviewingPhoto = false
+        capturedImageView.visibility = View.GONE
+        previewView.visibility = View.VISIBLE
+
+        captureButton.visibility = View.VISIBLE
+        saveButton.visibility = View.GONE
+        recaptureButton.visibility = View.GONE
+        cameraSwitchButton.isEnabled = true
+        flashButton.isEnabled = true
+        noteInput.isEnabled = true
+        noteInput.setText("")
+
+        capturedFile?.delete()
+        watermarkedFile?.delete()
+        capturedFile = null
+        watermarkedFile = null
+    }
+
+    private fun applyFlashSetting() {
+        imageCapture?.let { capture ->
+            capture.flashMode = if (flashEnabled) {
+                ImageCapture.FLASH_MODE_ON
+            } else {
+                ImageCapture.FLASH_MODE_OFF
+            }
+        }
+    }
+
+    private fun updateFlashButton() {
+        flashButton.text = if (flashEnabled) "Flash: ON" else "Flash: OFF"
+    }
+
+    private fun hasPermission(permission: String): Boolean {
+        return ContextCompat.checkSelfPermission(this, permission) ==
+            PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun showToast(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun dp(value: Int): Int {
+        return (value * resources.displayMetrics.density).toInt()
+    }
+
+    private fun makeButton(title: String, onClick: () -> Unit): Button {
+        return Button(this).apply {
+            text = title
+            textSize = 14f
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun weightedButtonParams(): LinearLayout.LayoutParams {
+        return LinearLayout.LayoutParams(
+            0,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            1f
+        ).apply {
+            setMargins(dp(4), dp(4), dp(4), dp(4))
+        }
+    }
+}
+
