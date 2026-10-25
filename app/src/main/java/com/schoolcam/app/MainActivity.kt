@@ -1,3 +1,4 @@
+Kotlin
 
 package com.schoolcam.app
 
@@ -641,5 +642,4 @@ class MainActivity : ComponentActivity() {
 
             exif.saveAttributes()
         } catch (_: Exception) {
-            // Visible watermark is still saved if EXIF GPS
-            
+            // Visible watermark is still saved if E
