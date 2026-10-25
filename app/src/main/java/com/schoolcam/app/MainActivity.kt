@@ -1,5 +1,3 @@
-Kotlin
-
 package com.schoolcam.app
 
 import android.Manifest
@@ -10,15 +8,11 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
-import android.location.Address
-import android.location.Geocoder
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -32,6 +26,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
@@ -42,7 +37,6 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.exifinterface.media.ExifInterface
-import androidx.activity.ComponentActivity
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -116,6 +110,14 @@ class MainActivity : ComponentActivity() {
                     "Camera ready. Allow location permission for GPS watermark."
             }
         }
+
+    private val locationListener = LocationListener { location ->
+        currentLocation = location
+        val lat = String.format(Locale.US, "%.6f", location.latitude)
+        val lng = String.format(Locale.US, "%.6f", location.longitude)
+        val acc = location.accuracy.toInt()
+        locationText.text = "GPS: Lat $lat, Lng $lng (±${acc}m)"
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -471,7 +473,6 @@ class MainActivity : ComponentActivity() {
                     statusText.text = "Review photo. Save or recapture."
                     captureButton.isEnabled = true
 
-                    // The ImageView now owns the displayed bitmap.
                     resultBitmap = null
                 }
             } catch (exception: Exception) {
@@ -637,9 +638,4 @@ class MainActivity : ComponentActivity() {
                 SimpleDateFormat(
                     "yyyy:MM:dd HH:mm:ss",
                     Locale.US
-                ).format(Date())
-            )
-
-            exif.saveAttributes()
-        } catch (_: Exception) {
-            // Visible watermark is still saved if E
+  
