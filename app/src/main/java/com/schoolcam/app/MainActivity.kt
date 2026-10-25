@@ -10,20 +10,22 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Typeface
+import android.location.Geocoder
 import android.location.Location
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import android.text.Editable
-import android.text.TextWatcher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.Camera
@@ -47,55 +49,59 @@ import java.util.concurrent.Executors
 class MainActivity : AppCompatActivity() {
 
     private lateinit var previewView: PreviewView
-    private lateinit var status: TextView
+    private lateinit var previewFrame: FrameLayout
+    private lateinit var reviewImage: ImageView
+    private lateinit var bottomPanel: LinearLayout
+    private lateinit var gpsInfo: TextView
+    private lateinit var noteInput: EditText
     private lateinit var captureButton: Button
     private lateinit var flipButton: Button
     private lateinit var flashButton: Button
     private lateinit var saveButton: Button
-    private lateinit var noteInput: EditText
-    private lateinit var reviewImage: ImageView
-    private lateinit var cameraLayout: LinearLayout
-    private lateinit var reviewLayout: LinearLayout
+    private lateinit var recaptureButton: Button
+
     private lateinit var cameraExecutor: ExecutorService
+    private lateinit var locationExecutor: ExecutorService
 
     private var imageCapture: ImageCapture? = null
     private var camera: Camera? = null
+
     private var frontCamera = false
     private var flashOn = false
+    private var isReviewing = false
+    private var isSaving = false
+
     private var capturedBitmap: Bitmap? = null
+    private var reviewBitmap: Bitmap? = null
     private var capturedLocation: Location? = null
+    private var capturedAddress = "Address unavailable"
+    private var currentAddress = "Finding address..."
     private var capturedAt = System.currentTimeMillis()
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var lastAddressLocation: Location? = null
+
+    private val clockUpdater = object : Runnable {
+        override fun run() {
+            updateGpsInfo()
+            mainHandler.postDelayed(this, 1000L)
+        }
+    }
 
     private val permissions =
         registerForActivityResult(
             ActivityResultContracts.RequestMultiplePermissions()
-        ) { results ->
-
-            val cameraGranted =
-                results[Manifest.permission.CAMERA] == true ||
-                    ContextCompat.checkSelfPermission(
-                        this,
-                        Manifest.permission.CAMERA
-                    ) == PackageManager.PERMISSION_GRANTED
-
-            if (cameraGranted) {
+        ) {
+            if (hasCameraPermission()) {
                 startCamera()
+                fetchLocation()
             } else {
-                status.text = "Camera permission is required."
+                gpsInfo.text = "Camera permission required"
             }
 
-            val locationGranted =
-                ContextCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.ACCESS_FINE_LOCATION
-                ) == PackageManager.PERMISSION_GRANTED ||
-                    ContextCompat.checkSelfPermission(
-                        this,
-                        Manifest.permission.ACCESS_COARSE_LOCATION
-                    ) == PackageManager.PERMISSION_GRANTED
-
-            if (cameraGranted && !locationGranted) {
-                status.text = "Camera ready • GPS permission not granted"
+            if (!hasLocationPermission()) {
+                currentAddress = "Location permission required"
+                updateGpsInfo()
             }
         }
 
@@ -103,57 +109,59 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         cameraExecutor = Executors.newSingleThreadExecutor()
+        locationExecutor = Executors.newSingleThreadExecutor()
 
         buildUi()
+        updateGpsInfo()
+        mainHandler.post(clockUpdater)
 
-        val requiredPermissions = arrayOf(
+        val missing = arrayOf(
             Manifest.permission.CAMERA,
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION
-        )
-
-        val missingPermissions = requiredPermissions.filter {
+        ).filter {
             ContextCompat.checkSelfPermission(
-                this,
-                it
+                this, it
             ) != PackageManager.PERMISSION_GRANTED
         }
 
-        if (missingPermissions.isEmpty()) {
+        if (missing.isEmpty()) {
             startCamera()
+            fetchLocation()
         } else {
-            permissions.launch(missingPermissions.toTypedArray())
+            permissions.launch(missing.toTypedArray())
         }
     }
+
+    private fun hasCameraPermission(): Boolean =
+        ContextCompat.checkSelfPermission(
+            this, Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
+
+    private fun hasLocationPermission(): Boolean {
+        val fine = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+
+        val coarse = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+
+        return fine || coarse
+    }
+
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density).toInt()
 
     private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.rgb(8, 13, 24))
-            setPadding(dp(12), dp(8), dp(12), dp(12))
+            setBackgroundColor(Color.BLACK)
         }
 
-        val title = TextView(this).apply {
-            text = "SchoolCam"
-            textSize = 23f
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(4), dp(6), dp(4), dp(10))
-        }
-
-        root.addView(title)
-
-        status = TextView(this).apply {
-            text = "Starting camera..."
-            textSize = 12f
-            setTextColor(Color.rgb(160, 190, 225))
-            setPadding(dp(4), 0, dp(4), dp(8))
-        }
-
-        root.addView(status)
-
-        cameraLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+        // Upper 75%: live camera or captured photo
+        previewFrame = FrameLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
         }
 
         previewView = PreviewView(this).apply {
@@ -162,77 +170,112 @@ class MainActivity : AppCompatActivity() {
             scaleType = PreviewView.ScaleType.FILL_CENTER
         }
 
-        cameraLayout.addView(
-            previewView,
-            LinearLayout.LayoutParams(-1, 0, 1f)
-        )
-
-        val controls = LinearLayout(this).apply {
-            gravity = Gravity.CENTER
-            orientation = LinearLayout.HORIZONTAL
-        }
-
-        flipButton = makeButton("↻ Camera") {
-            frontCamera = !frontCamera
-            startCamera()
-        }
-
-        captureButton = makeButton("● CAPTURE") {
-            capturePhoto()
-        }
-
-        flashButton = makeButton("⚡ Flash off") {
-            flashOn = !flashOn
-
-            imageCapture?.flashMode =
-                if (flashOn) {
-                    ImageCapture.FLASH_MODE_ON
-                } else {
-                    ImageCapture.FLASH_MODE_OFF
-                }
-
-            flashButton.text =
-                if (flashOn) "⚡ Flash on" else "⚡ Flash off"
-        }
-
-        controls.addView(flipButton, weightParams())
-        controls.addView(captureButton, weightParams())
-        controls.addView(flashButton, weightParams())
-
-        cameraLayout.addView(controls)
-
-        root.addView(
-            cameraLayout,
-            LinearLayout.LayoutParams(-1, 0, 1f)
-        )
-
-        reviewLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+        reviewImage = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setBackgroundColor(Color.BLACK)
             visibility = View.GONE
         }
 
-        reviewImage = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.FIT_CENTER
-            adjustViewBounds = true
+        previewFrame.addView(
+            previewView,
+            FrameLayout.LayoutParams(-1, -1)
+        )
+        previewFrame.addView(
+            reviewImage,
+            FrameLayout.LayoutParams(-1, -1)
+        )
+
+        root.addView(
+            previewFrame,
+            LinearLayout.LayoutParams(-1, 0, 3f)
+        )
+
+        // Lower 25%: details, note and controls
+        bottomPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            setBackgroundColor(Color.rgb(9, 17, 30))
         }
 
-        reviewLayout.addView(
-            reviewImage,
+        val heading = TextView(this).apply {
+            text = "SchoolCam  •  GPS Camera"
+            textSize = 15f
+            setTextColor(Color.WHITE)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+        }
+        bottomPanel.addView(heading)
+
+        gpsInfo = TextView(this).apply {
+            textSize = 11f
+            setTextColor(Color.rgb(205, 225, 250))
+            gravity = Gravity.CENTER
+            maxLines = 4
+            setPadding(0, dp(3), 0, dp(3))
+        }
+        bottomPanel.addView(gpsInfo)
+
+        noteInput = EditText(this).apply {
+            hint = "Write note (optional)"
+            setHintTextColor(Color.LTGRAY)
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            minLines = 1
+            maxLines = 2
+            setPadding(dp(8), 0, dp(8), 0)
+            setBackgroundColor(Color.rgb(28, 37, 53))
+            visibility = View.GONE
+        }
+        bottomPanel.addView(
+            noteInput,
+            LinearLayout.LayoutParams(-1, dp(48))
+        )
+
+        val buttons = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+
+        flipButton = makeButton("↻ Flip") {
+            frontCamera = !frontCamera
+            flashOn = false
+            startCamera()
+        }
+
+        captureButton = makeButton("● Capture") {
+            capturePhoto()
+        }
+
+        flashButton = makeButton("⚡ Flash OFF") {
+            toggleFlash()
+        }
+
+        recaptureButton = makeButton("↻ Retake") {
+            returnToCamera()
+        }
+
+        saveButton = makeButton("Save Photo") {
+            savePhoto()
+        }
+
+        buttons.addView(flipButton, buttonParams())
+        buttons.addView(captureButton, buttonParams())
+        buttons.addView(flashButton, buttonParams())
+        buttons.addView(recaptureButton, buttonParams())
+        buttons.addView(saveButton, buttonParams())
+
+        bottomPanel.addView(buttons)
+
+        root.addView(
+            bottomPanel,
             LinearLayout.LayoutParams(-1, 0, 1f)
         )
 
-        noteInput = EditText(this).apply {
-            hint = "Add note (optional) — school / activity"
-            setHintTextColor(Color.LTGRAY)
-            setTextColor(Color.WHITE)
-            setSingleLine(false)
-            minLines = 2
-            maxLines = 3
-            setPadding(dp(12), dp(8), dp(12), dp(8))
-            setBackgroundColor(Color.rgb(28, 37, 53))
-        }
+        setContentView(root)
 
-        noteInput.addTextChangedListener(object : TextWatcher {
+        noteInput.addTextChangedListener(object :
+            android.text.TextWatcher {
 
             override fun beforeTextChanged(
                 s: CharSequence?,
@@ -247,56 +290,63 @@ class MainActivity : AppCompatActivity() {
                 before: Int,
                 count: Int
             ) {
-                if (reviewLayout.visibility == View.VISIBLE) {
-                    renderReview()
-                }
+                if (isReviewing) renderReview()
             }
 
-            override fun afterTextChanged(s: Editable?) = Unit
+            override fun afterTextChanged(
+                s: android.text.Editable?
+            ) = Unit
         })
 
-        reviewLayout.addView(noteInput)
+        showCameraControls()
+    }
 
-        val reviewControls = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
+    private fun buttonParams(): LinearLayout.LayoutParams =
+        LinearLayout.LayoutParams(0, dp(48), 1f).apply {
+            setMargins(dp(2), dp(2), dp(2), dp(2))
         }
 
-        val recaptureButton = makeButton("↻ Recapture") {
-            returnToCamera()
-        }
+    private fun makeButton(
+        label: String,
+        action: () -> Unit
+    ): Button = Button(this).apply {
+        text = label
+        textSize = 10f
+        isAllCaps = false
+        setTextColor(Color.WHITE)
+        setPadding(dp(1), 0, dp(1), 0)
+        backgroundTintList =
+            android.content.res.ColorStateList.valueOf(
+                Color.rgb(31, 91, 158)
+            )
+        setOnClickListener { action() }
+    }
 
-        saveButton = makeButton("Save Photo") {
-            savePhoto()
-        }
+    private fun showCameraControls() {
+        captureButton.visibility = View.VISIBLE
+        flipButton.visibility = View.VISIBLE
+        flashButton.visibility = View.VISIBLE
+        recaptureButton.visibility = View.GONE
+        saveButton.visibility = View.GONE
+        noteInput.visibility = View.GONE
+    }
 
-        reviewControls.addView(recaptureButton, weightParams())
-        reviewControls.addView(saveButton, weightParams())
-
-        reviewLayout.addView(reviewControls)
-
-        root.addView(
-            reviewLayout,
-            LinearLayout.LayoutParams(-1, 0, 1f)
-        )
-
-        setContentView(root)
+    private fun showReviewControls() {
+        captureButton.visibility = View.GONE
+        flipButton.visibility = View.GONE
+        flashButton.visibility = View.GONE
+        recaptureButton.visibility = View.VISIBLE
+        saveButton.visibility = View.VISIBLE
+        noteInput.visibility = View.VISIBLE
     }
 
     private fun startCamera() {
-        if (
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.CAMERA
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            return
-        }
+        if (!hasCameraPermission()) return
 
         val providerFuture =
             ProcessCameraProvider.getInstance(this)
 
         providerFuture.addListener({
-
             try {
                 val provider = providerFuture.get()
 
@@ -306,25 +356,18 @@ class MainActivity : AppCompatActivity() {
                         it.setSurfaceProvider(previewView.surfaceProvider)
                     }
 
-                val newCapture = ImageCapture.Builder()
+                val capture = ImageCapture.Builder()
                     .setCaptureMode(
                         ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY
                     )
-                    .setFlashMode(
-                        if (flashOn) {
-                            ImageCapture.FLASH_MODE_ON
-                        } else {
-                            ImageCapture.FLASH_MODE_OFF
-                        }
-                    )
+                    .setFlashMode(ImageCapture.FLASH_MODE_OFF)
                     .build()
 
-                val selector =
-                    if (frontCamera) {
-                        CameraSelector.DEFAULT_FRONT_CAMERA
-                    } else {
-                        CameraSelector.DEFAULT_BACK_CAMERA
-                    }
+                val selector = if (frontCamera) {
+                    CameraSelector.DEFAULT_FRONT_CAMERA
+                } else {
+                    CameraSelector.DEFAULT_BACK_CAMERA
+                }
 
                 provider.unbindAll()
 
@@ -332,44 +375,71 @@ class MainActivity : AppCompatActivity() {
                     this,
                     selector,
                     preview,
-                    newCapture
+                    capture
                 )
 
-                imageCapture = newCapture
+                imageCapture = capture
 
-                status.text =
-                    if (frontCamera) {
-                        "Front camera • GPS watermark enabled"
-                    } else {
-                        "Back camera • GPS watermark enabled"
-                    }
+                if (flashOn &&
+                    camera?.cameraInfo?.hasFlashUnit() == true
+                ) {
+                    camera?.cameraControl?.enableTorch(true)
+                }
 
                 flashButton.isEnabled =
                     camera?.cameraInfo?.hasFlashUnit() == true
 
                 flashButton.text =
-                    if (flashOn) "⚡ Flash on" else "⚡ Flash off"
+                    if (flashOn) "⚡ Flash ON" else "⚡ Flash OFF"
+
+                if (!isReviewing) {
+                    previewView.visibility = View.VISIBLE
+                    reviewImage.visibility = View.GONE
+                }
+
+                updateGpsInfo()
 
             } catch (e: Exception) {
-                status.text =
-                    "Unable to start camera: ${e.localizedMessage ?: "unknown error"}"
+                gpsInfo.text =
+                    "Camera error: ${e.localizedMessage ?: "unknown"}"
             }
-
         }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun capturePhoto() {
-        val capture = imageCapture ?: run {
-            status.text = "Camera is not ready."
+    private fun toggleFlash() {
+        val activeCamera = camera
+
+        if (activeCamera == null ||
+            activeCamera.cameraInfo.hasFlashUnit().not()
+        ) {
+            Toast.makeText(
+                this,
+                "Flash is not available on this camera",
+                Toast.LENGTH_SHORT
+            ).show()
             return
         }
 
+        val newState = !flashOn
+
+        activeCamera.cameraControl.enableTorch(newState)
+            .addListener({
+                runOnUiThread {
+                    flashOn = newState
+                    flashButton.text =
+                        if (flashOn) "⚡ Flash ON" else "⚡ Flash OFF"
+                }
+            }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun capturePhoto() {
+        val capture = imageCapture ?: return
+
         captureButton.isEnabled = false
-        status.text = "Capturing photo..."
 
         val tempFile = File(
             cacheDir,
-            "schoolcam_preview_${System.currentTimeMillis()}.jpg"
+            "schoolcam_${System.currentTimeMillis()}.jpg"
         )
 
         val options =
@@ -384,26 +454,29 @@ class MainActivity : AppCompatActivity() {
                     output: ImageCapture.OutputFileResults
                 ) {
                     try {
-                        val raw =
-                            BitmapFactory.decodeFile(tempFile.absolutePath)
-                                ?: throw IllegalStateException(
-                                    "Could not decode captured photo"
-                                )
+                        val bitmap = BitmapFactory.decodeFile(
+                            tempFile.absolutePath
+                        ) ?: throw IllegalStateException(
+                            "Unable to read captured photo"
+                        )
 
                         runOnUiThread {
                             capturedBitmap?.recycle()
-                            capturedBitmap = raw
+                            capturedBitmap = bitmap
                             capturedAt = System.currentTimeMillis()
-                            capturedLocation = null
+                            capturedLocation = currentBestLocation()
+                            capturedAddress = currentAddress
+                            isReviewing = true
+
+                            previewView.visibility = View.GONE
+                            reviewImage.visibility = View.VISIBLE
+
+                            showReviewControls()
+                            noteInput.setText("")
+                            renderReview()
 
                             captureButton.isEnabled = true
-                            cameraLayout.visibility = View.GONE
-                            reviewLayout.visibility = View.VISIBLE
-                            noteInput.setText("")
-
-                            renderReview()
-                            status.text =
-                                "Review photo • Add note, Save or Recapture"
+                            updateGpsInfo()
 
                             fetchLocation()
                         }
@@ -411,42 +484,44 @@ class MainActivity : AppCompatActivity() {
                     } catch (e: Exception) {
                         runOnUiThread {
                             captureButton.isEnabled = true
-                            status.text =
-                                "Capture failed: ${e.localizedMessage}"
+                            Toast.makeText(
+                                this@MainActivity,
+                                "Capture failed: ${e.localizedMessage}",
+                                Toast.LENGTH_LONG
+                            ).show()
                         }
                     } finally {
                         tempFile.delete()
                     }
                 }
 
-                override fun onError(exception: ImageCaptureException) {
+                override fun onError(
+                    exception: ImageCaptureException
+                ) {
                     tempFile.delete()
 
                     runOnUiThread {
                         captureButton.isEnabled = true
-                        status.text =
-                            "Capture failed: ${exception.message}"
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Capture failed: ${exception.message}",
+                            Toast.LENGTH_LONG
+                        ).show()
                     }
                 }
             }
         )
     }
 
+    private fun currentBestLocation(): Location? =
+        capturedLocation?.let {
+            Location(it)
+        }
+
     private fun fetchLocation() {
-        val fineGranted =
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.ACCESS_FINE_LOCATION
-            ) == PackageManager.PERMISSION_GRANTED
-
-        val coarseGranted =
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.ACCESS_COARSE_LOCATION
-            ) == PackageManager.PERMISSION_GRANTED
-
-        if (!fineGranted && !coarseGranted) {
-            renderReview()
+        if (!hasLocationPermission()) {
+            currentAddress = "Location permission required"
+            updateGpsInfo()
             return
         }
 
@@ -461,283 +536,110 @@ class MainActivity : AppCompatActivity() {
                 token.token
             ).addOnSuccessListener { location ->
 
-                capturedLocation = location
+                if (location != null) {
+                    capturedLocation = Location(location)
+                    lastAddressLocation = Location(location)
 
-                if (reviewLayout.visibility == View.VISIBLE) {
-                    renderReview()
+                    currentAddress = "Finding address..."
+                    updateGpsInfo()
+                    lookupAddress(location)
+                } else {
+                    client.lastLocation.addOnSuccessListener { last ->
+                        if (last != null) {
+                            capturedLocation = Location(last)
+                            lastAddressLocation = Location(last)
+                            lookupAddress(last)
+                        } else {
+                            currentAddress = "GPS fix unavailable"
+                            updateGpsInfo()
+                        }
+                    }
                 }
 
             }.addOnFailureListener {
-                renderReview()
+                currentAddress = "GPS location unavailable"
+                updateGpsInfo()
             }
 
         } catch (_: SecurityException) {
-            capturedLocation = null
-            renderReview()
+            currentAddress = "Location permission required"
+            updateGpsInfo()
         }
     }
 
-    private fun renderReview() {
-        val bitmap = capturedBitmap ?: return
+    @Suppress("DEPRECATION")
+    private fun lookupAddress(location: Location) {
+        locationExecutor.execute {
+            var addressText = "Address unavailable"
 
-        val previewBitmap = addWatermark(
-            bitmap,
-            noteInput.text.toString(),
-            capturedLocation,
-            capturedAt
-        )
+            try {
+                if (Geocoder.isPresent()) {
+                    val geocoder = Geocoder(
+                        this,
+                        Locale.getDefault()
+                    )
 
-        reviewImage.setImageBitmap(previewBitmap)
-        previewBitmap.recycle()
+                    val addresses = geocoder.getFromLocation(
+                        location.latitude,
+                        location.longitude,
+                        1
+                    )
+
+                    if (!addresses.isNullOrEmpty()) {
+                        addressText =
+                            addresses[0].getAddressLine(0)
+                                ?: "Address unavailable"
+                    }
+                }
+            } catch (_: Exception) {
+                addressText = "Address unavailable"
+            }
+
+            val result = addressText
+
+            mainHandler.post {
+                currentAddress = result
+
+                if (isReviewing) {
+                    capturedAddress = result
+                    renderReview()
+                }
+
+                updateGpsInfo()
+            }
+        }
     }
 
-    private fun addWatermark(
-        source: Bitmap,
-        note: String,
-        location: Location?,
-        time: Long
-    ): Bitmap {
-        val output = source.copy(Bitmap.Config.ARGB_8888, true)
-            ?: throw IllegalStateException("Could not prepare photo")
+    private fun updateGpsInfo() {
+        val now = SimpleDateFormat(
+            "dd MMM yyyy  •  HH:mm:ss",
+            Locale.getDefault()
+        ).format(Date())
 
-        val canvas = Canvas(output)
+        val location = if (isReviewing) {
+            capturedLocation
+        } else {
+            lastAddressLocation ?: capturedLocation
+        }
 
-        val padding = (output.width * 0.025f).coerceAtLeast(16f)
-        val textSize = (output.width * 0.026f).coerceIn(20f, 44f)
+        val address = if (isReviewing) {
+            capturedAddress
+        } else {
+            currentAddress
+        }
 
-        val lines = mutableListOf<String>()
-
-        if (location != null) {
-            lines.add(
-                "Latitude: %.6f   Longitude: %.6f".format(
-                    Locale.US,
-                    location.latitude,
-                    location.longitude
-                )
-            )
-
-            lines.add(
-                "GPS accuracy: %.0f m".format(
-                    Locale.US,
-                    location.accuracy
-                )
+        val coordinates = if (location != null) {
+            "Lat: %.6f  |  Long: %.6f".format(
+                Locale.US,
+                location.latitude,
+                location.longitude
             )
         } else {
-            lines.add("Location unavailable")
+            "Latitude: --  |  Longitude: --"
         }
 
-        lines.add(
-            SimpleDateFormat(
-                "dd MMM yyyy • hh:mm:ss a",
-                Locale.getDefault()
-            ).format(Date(time))
-        )
+        val accuracy = location?.let {
+            "GPS accuracy: %.0f m".format(Locale.US, it.accuracy)
+        } ?: "Waiting for GPS fix..."
 
-        if (note.isNotBlank()) {
-            lines.add("Note: " + note.trim().replace("\n", " "))
-        }
-
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            this.textSize = textSize
-            typeface = Typeface.create(
-                "sans-serif-medium",
-                Typeface.BOLD
-            )
-        }
-
-        val lineHeight = textSize * 1.45f
-        val panelHeight = padding * 2 + lineHeight * lines.size
-
-        val panelPaint = Paint().apply {
-            color = Color.argb(190, 4, 10, 20)
-        }
-
-        canvas.drawRect(
-            0f,
-            output.height - panelHeight,
-            output.width.toFloat(),
-            output.height.toFloat(),
-            panelPaint
-        )
-
-        lines.forEachIndexed { index, line ->
-            canvas.drawText(
-                line.take(150),
-                padding,
-                output.height - panelHeight +
-                    padding + textSize + index * lineHeight,
-                paint
-            )
-        }
-
-        return output
-    }
-
-    private fun savePhoto() {
-        val bitmap = capturedBitmap ?: run {
-            status.text = "No photo to save."
-            return
-        }
-
-        saveButton.isEnabled = false
-        status.text = "Saving photo..."
-
-        var outputUri: Uri? = null
-        var finalBitmap: Bitmap? = null
-
-        try {
-            finalBitmap = addWatermark(
-                bitmap,
-                noteInput.text.toString(),
-                capturedLocation,
-                capturedAt
-            )
-
-            val stamp = SimpleDateFormat(
-                "yyyyMMdd_HHmmss",
-                Locale.US
-            ).format(Date(capturedAt))
-
-            val values = ContentValues().apply {
-                put(
-                    MediaStore.Images.Media.DISPLAY_NAME,
-                    "SchoolCam_$stamp.jpg"
-                )
-                put(
-                    MediaStore.Images.Media.MIME_TYPE,
-                    "image/jpeg"
-                )
-                put(
-                    MediaStore.Images.Media.RELATIVE_PATH,
-                    "Pictures/SchoolCam"
-                )
-                put(MediaStore.Images.Media.IS_PENDING, 1)
-            }
-
-            val newUri = contentResolver.insert(
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                values
-            ) ?: throw IllegalStateException(
-                "Could not create image file"
-            )
-
-            outputUri = newUri
-
-            val stream = contentResolver.openOutputStream(newUri)
-                ?: throw IllegalStateException(
-                    "Could not open image file"
-                )
-
-            stream.use {
-                val success = finalBitmap.compress(
-                    Bitmap.CompressFormat.JPEG,
-                    95,
-                    it
-                )
-
-                if (!success) {
-                    throw IllegalStateException("JPEG encoding failed")
-                }
-            }
-
-            val completedValues = ContentValues().apply {
-                put(MediaStore.Images.Media.IS_PENDING, 0)
-            }
-
-            contentResolver.update(
-                newUri,
-                completedValues,
-                null,
-                null
-            )
-
-            status.text = "Saved to Pictures/SchoolCam"
-
-            Toast.makeText(
-                this,
-                "Photo saved to Pictures/SchoolCam",
-                Toast.LENGTH_LONG
-            ).show()
-
-            returnToCamera()
-
-        } catch (e: Exception) {
-            outputUri?.let { savedUri ->
-                contentResolver.delete(savedUri, null, null)
-            }
-
-            status.text =
-                "Save failed: ${e.localizedMessage ?: "unknown error"}"
-
-            Toast.makeText(
-                this,
-                status.text,
-                Toast.LENGTH_LONG
-            ).show()
-
-        } finally {
-            finalBitmap?.recycle()
-            saveButton.isEnabled = true
-        }
-    }
-
-    private fun returnToCamera() {
-        reviewImage.setImageDrawable(null)
-
-        capturedBitmap?.recycle()
-        capturedBitmap = null
-        capturedLocation = null
-
-        noteInput.setText("")
-
-        reviewLayout.visibility = View.GONE
-        cameraLayout.visibility = View.VISIBLE
-
-        status.text = "Ready to capture"
-    }
-
-    private fun makeButton(
-        label: String,
-        action: () -> Unit
-    ): Button {
-        return Button(this).apply {
-            text = label
-            textSize = 11f
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-
-            backgroundTintList =
-                android.content.res.ColorStateList.valueOf(
-                    Color.rgb(34, 91, 155)
-                )
-
-            setOnClickListener {
-                action()
-            }
-        }
-    }
-
-    private fun weightParams(): LinearLayout.LayoutParams {
-        return LinearLayout.LayoutParams(
-            0,
-            dp(54),
-            1f
-        ).apply {
-            setMargins(dp(3), dp(6), dp(3), dp(6))
-        }
-    }
-
-    private fun dp(value: Int): Int {
-        return (value * resources.displayMetrics.density).toInt()
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-
-        cameraExecutor.shutdown()
-
-        capturedBitmap?.recycle()
-        capturedBitmap = null
-    }
-}
+        gpsInfo.text = "$coordinates\n$
